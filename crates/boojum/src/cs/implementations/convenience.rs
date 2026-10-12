@@ -195,6 +195,7 @@ impl<
     }
 }
 
+/// `expected_proof_config` must come from verifier policy, independently of `proof`.
 pub fn verify_circuit<
     F: SmallField,
     C: Circuit<F>,
@@ -206,6 +207,7 @@ pub fn verify_circuit<
     circuit: &C,
     proof: &Proof<F, H, EXT>,
     vk: &VerificationKey<F, H>,
+    expected_proof_config: &ProofConfig,
     transcript_params: TR::TransciptParameters,
 ) -> bool {
     let builder_impl =
@@ -216,5 +218,5 @@ pub fn verify_circuit<
     let builder = circuit.configure_builder(builder);
 
     let verifier = builder.build(());
-    verifier.verify::<H, TR, POW>(transcript_params, vk, proof)
+    verifier.verify::<H, TR, POW>(transcript_params, vk, proof, expected_proof_config)
 }

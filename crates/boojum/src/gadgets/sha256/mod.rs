@@ -527,7 +527,7 @@ mod test {
             &setup,
             &setup_tree,
             &vk,
-            prover_config,
+            prover_config.clone(),
             (),
         );
 
@@ -539,7 +539,7 @@ mod test {
         let builder = configure(builder);
         let verifier = builder.build(());
 
-        let is_valid = verifier.verify::<T, TR, NoPow>((), &vk, &proof);
+        let is_valid = verifier.verify::<T, TR, NoPow>((), &vk, &proof, &prover_config);
 
         assert!(is_valid);
     }

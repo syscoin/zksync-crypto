@@ -1364,6 +1364,9 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>, CS: ConstraintSystem<
         // get challenges
         let c0 = transcript.get_challenge(cs);
         let c1 = transcript.get_challenge(cs);
+        let lift_offset = NumExtAsFieldWrapper::<F, EXT, CS>::from_num_coeffs_in_base(
+            transcript.get_multiple_challenges_fixed::<_, 2>(cs),
+        );
 
         let expected_lookup_polys_total = if self.lookup_parameters.lookup_is_allowed() {
             num_lookup_subarguments + // lookup witness encoding polys
@@ -1888,6 +1891,14 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>, CS: ConstraintSystem<
 
             assert_eq!(challenge_offset, challenges_for_fri_quotiening.len());
 
+            let x = NumExtAsFieldWrapper::<F, EXT, CS>::from_coeffs_in_base([
+                domain_element_for_quotiening,
+                NumAsFieldWrapper::constant(F::ZERO, cs),
+            ]);
+            let mut lift = lift_offset;
+            lift.add_assign(&x, cs);
+            simulated_ext_element.mul_assign(&lift, cs);
+
             let mut current_folded_value = simulated_ext_element;
             let mut subidx = base_tree_idx;
             let mut coset_inverse = base_coset_inverse;
@@ -2216,6 +2227,161 @@ mod test {
     use crate::implementations::poseidon2::Poseidon2Goldilocks;
 
     #[test]
+    fn test_recursive_verification_of_degree_lifted_proof() {
+        use crate::cs::cs_builder::{CsBuilder, CsBuilderImpl};
+        use crate::field::{Field, U64Representable};
+        use crate::gadgets::traits::allocatable::CSAllocatable;
+        use crate::worker::Worker;
+
+        type F = GoldilocksField;
+        type Ext = GoldilocksExt2;
+        type TR = GoldilocksPoisedon2Transcript;
+        type R = Poseidon2Goldilocks;
+        type Ctr = CircuitAlgebraicSpongeBasedTranscript<F, 8, 12, 4, R>;
+        type H = GoldilocksPoseidon2Sponge<AbsorptionModeOverwrite>;
+        type RH = CircuitGoldilocksPoseidon2Sponge;
+
+        fn configure<
+            T: CsBuilderImpl<F, T>,
+            GC: GateConfigurationHolder<F>,
+            TB: StaticToolboxHolder,
+        >(
+            builder: CsBuilder<T, F, GC, TB>,
+        ) -> CsBuilder<T, F, impl GateConfigurationHolder<F>, impl StaticToolboxHolder> {
+            let builder = ConstantsAllocatorGate::configure_builder(
+                builder,
+                GatePlacementStrategy::UseGeneralPurposeColumns,
+            );
+            let builder = FmaGateInBaseFieldWithoutConstant::configure_builder(
+                builder,
+                GatePlacementStrategy::UseGeneralPurposeColumns,
+            );
+            let builder = PublicInputGate::configure_builder(
+                builder,
+                GatePlacementStrategy::UseGeneralPurposeColumns,
+            );
+            NopGate::configure_builder(builder, GatePlacementStrategy::UseGeneralPurposeColumns)
+        }
+
+        let geometry = CSGeometry {
+            num_columns_under_copy_permutation: 8,
+            num_witness_columns: 0,
+            num_constant_columns: 2,
+            max_allowed_constraint_degree: 8,
+        };
+        let builder_impl =
+            CsReferenceImplementationBuilder::<F, F, DevCSConfig>::new(geometry, 128);
+        let builder = configure(new_builder::<_, F>(builder_impl));
+        let mut inner_cs = builder.build(CircuitResolverOpts::new(512));
+        let a = inner_cs.alloc_single_variable_from_witness(F::from_u64_unchecked(3));
+        let b = inner_cs.alloc_single_variable_from_witness(F::from_u64_unchecked(5));
+        let result = FmaGateInBaseFieldWithoutConstant::compute_fma(
+            &mut inner_cs,
+            F::ONE,
+            (a, b),
+            F::ONE,
+            a,
+        );
+        for _ in 0..16 {
+            let _ = FmaGateInBaseFieldWithoutConstant::compute_fma(
+                &mut inner_cs,
+                F::ONE,
+                (a, b),
+                F::ONE,
+                a,
+            );
+        }
+        PublicInputGate::new(result).add_to_cs(&mut inner_cs);
+        inner_cs.allocate_constant(F::ONE);
+        inner_cs.pad_and_shrink();
+        let worker = Worker::new_with_num_threads(2);
+        let proof_config = ProofConfig {
+            fri_lde_factor: 16,
+            merkle_tree_cap_size: 16,
+            pow_bits: 0,
+            ..Default::default()
+        };
+        let (proof, vk) = inner_cs
+            .into_assembly::<Global>()
+            .prove_one_shot::<Ext, TR, H, NoPow>(&worker, proof_config.clone(), ());
+
+        let builder_impl = CsVerifierBuilder::<F, Ext>::new_from_parameters(geometry);
+        let verifier = configure(new_builder::<_, F>(builder_impl)).build(());
+        assert!(verifier.verify::<H, TR, NoPow>((), &vk, &proof, &proof_config));
+
+        let outer_geometry = CSGeometry {
+            num_columns_under_copy_permutation: 132,
+            num_witness_columns: 0,
+            num_constant_columns: 4,
+            max_allowed_constraint_degree: 8,
+        };
+        let builder_impl =
+            CsReferenceImplementationBuilder::<F, F, DevCSConfig>::new(outer_geometry, 1 << 14);
+        let builder = new_builder::<_, F>(builder_impl);
+        let builder = ConstantsAllocatorGate::configure_builder(
+            builder,
+            GatePlacementStrategy::UseGeneralPurposeColumns,
+        );
+        let builder = BooleanConstraintGate::configure_builder(
+            builder,
+            GatePlacementStrategy::UseGeneralPurposeColumns,
+        );
+        let builder = Poseidon2FlattenedGate::<F, 8, 12, 4, R>::configure_builder(
+            builder,
+            GatePlacementStrategy::UseGeneralPurposeColumns,
+        );
+        let builder = FmaGateInBaseFieldWithoutConstant::configure_builder(
+            builder,
+            GatePlacementStrategy::UseGeneralPurposeColumns,
+        );
+        let builder = SelectionGate::configure_builder(
+            builder,
+            GatePlacementStrategy::UseGeneralPurposeColumns,
+        );
+        let builder = ReductionGate::<F, 4>::configure_builder(
+            builder,
+            GatePlacementStrategy::UseGeneralPurposeColumns,
+        );
+        let builder = ZeroCheckGate::configure_builder(
+            builder,
+            GatePlacementStrategy::UseGeneralPurposeColumns,
+            false,
+        );
+        let builder =
+            NopGate::configure_builder(builder, GatePlacementStrategy::UseGeneralPurposeColumns);
+        let mut cs = builder.build(CircuitResolverOpts::new(1 << 20));
+        let builder_impl =
+            CsRecursiveVerifierBuilder::<'_, F, Ext, _>::new_from_parameters(&mut cs, geometry);
+        let verifier = configure(new_builder::<_, F>(builder_impl)).build(());
+        let allocated_vk = AllocatedVerificationKey::<F, RH>::allocate(&mut cs, vk.clone());
+        let allocated_proof = AllocatedProof::<F, RH, Ext>::allocate_from_witness(
+            &mut cs,
+            Some(proof),
+            &verifier,
+            &vk.fixed_parameters,
+            &proof_config,
+        );
+        let (is_valid, public_inputs) = verifier.verify::<RH, TR, Ctr, NoPow>(
+            &mut cs,
+            (),
+            &allocated_proof,
+            &vk.fixed_parameters,
+            &proof_config,
+            &allocated_vk,
+        );
+        assert!(is_valid.witness_hook(&cs)().unwrap());
+        assert_eq!(public_inputs.len(), 1);
+        assert_eq!(
+            public_inputs[0].witness_hook(&cs)().unwrap(),
+            F::from_u64_unchecked(18)
+        );
+        let true_value = Boolean::allocated_constant(&mut cs, true);
+        Boolean::enforce_equal(&mut cs, &is_valid, &true_value);
+        cs.pad_and_shrink();
+        assert!(cs.into_assembly::<Global>().check_if_satisfied(&worker));
+    }
+
+    #[test]
     fn test_recursive_verification() {
         type F = GoldilocksField;
         type P = GoldilocksField;
@@ -2369,7 +2535,15 @@ mod test {
 
         let verifier = builder.build(());
 
-        let is_valid_proof = verifier.verify::<H, TR, NoPow>((), &vk, &proof);
+        let expected_proof_config = ProofConfig {
+            fri_lde_factor: vk.fixed_parameters.fri_lde_factor,
+            merkle_tree_cap_size: vk.fixed_parameters.cap_size,
+            fri_folding_schedule: None,
+            security_level: 100,
+            pow_bits: 0,
+        };
+        let is_valid_proof =
+            verifier.verify::<H, TR, NoPow>((), &vk, &proof, &expected_proof_config);
         assert!(is_valid_proof);
 
         let builder_impl = CsRecursiveVerifierBuilder::<'_, F, Ext, _>::new_from_parameters(

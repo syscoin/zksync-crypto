@@ -26,6 +26,7 @@ pub(crate) fn verify_fri_part<
 
     // get challenges
     challenges.get_challenges_for_fri_quotiening(cs, transcript, constants.total_num_challenges_for_fri_quotiening)?;
+    let lift_offset = GoldilocksExtAsFieldWrapper::from_coeffs_in_base(transcript.get_multiple_challenges_fixed::<_, 2>(cs)?);
     challenges.get_fri_intermediate_challenges(cs, transcript, proof, fixed_parameters, constants)?;
 
     assert_eq!(constants.final_expected_degree as usize, proof.final_fri_monomials[0].len());
@@ -162,6 +163,11 @@ pub(crate) fn verify_fri_part<
             verifier,
             constants,
         )?;
+
+        let x = GoldilocksExtAsFieldWrapper::from_wrapper_coeffs_in_base([domain_element_for_quotiening, GoldilocksAsFieldWrapper::constant(GL::ZERO, cs)]);
+        let mut lift = lift_offset;
+        lift.add_assign(&x, cs);
+        simulated_ext_element.mul_assign(&lift, cs);
 
         let base_coset_inverse = BoojumPrimeField::inverse(&GL::multiplicative_generator()).unwrap();
 

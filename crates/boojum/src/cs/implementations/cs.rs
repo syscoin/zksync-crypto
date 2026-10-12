@@ -1182,7 +1182,7 @@ mod test {
             GoldilocksPoisedonTranscript,
             GoldilocksPoseidonSponge<AbsorptionModeOverwrite>,
             NoPow,
-        >(&worker, proof_config, ());
+        >(&worker, proof_config.clone(), ());
 
         let builder_impl = CsVerifierBuilder::<F, GoldilocksExt2>::new_from_parameters(geometry);
         let builder = new_builder::<_, F>(builder_impl);
@@ -1190,17 +1190,48 @@ mod test {
         let builder = configure(builder);
         let verifier = builder.build(());
 
-        let is_valid = verifier.verify::<
-            GoldilocksPoseidonSponge<AbsorptionModeOverwrite>,
-            GoldilocksPoisedonTranscript,
-            NoPow
-        >(
-            (),
-            &vk,
-            &proof,
+        let verify = |candidate| {
+            verifier.verify::<
+                GoldilocksPoseidonSponge<AbsorptionModeOverwrite>,
+                GoldilocksPoisedonTranscript,
+                NoPow,
+            >((), &vk, candidate, &proof_config)
+        };
+
+        assert!(verify(&proof), "the original proof must verify");
+        assert!(proof.queries_per_fri_repetition.len() > 1);
+
+        let mut empty_queries = proof.clone();
+        empty_queries.queries_per_fri_repetition.clear();
+        assert!(!verify(&empty_queries), "an empty FRI query list must fail");
+
+        let mut short_queries = proof.clone();
+        short_queries.queries_per_fri_repetition.pop();
+        assert!(!verify(&short_queries), "one missing FRI query must fail");
+
+        let mut excess_queries = proof.clone();
+        excess_queries
+            .queries_per_fri_repetition
+            .push(proof.queries_per_fri_repetition[0].clone());
+        assert!(!verify(&excess_queries), "an extra FRI query must fail");
+
+        let mut low_security = proof.clone();
+        low_security.proof_config.security_level = 1;
+        low_security.queries_per_fri_repetition.truncate(2);
+        assert!(
+            !verify(&low_security),
+            "the proof must not reduce its own FRI query requirement"
         );
 
-        assert!(is_valid);
+        let mut forged_pow = proof.clone();
+        forged_pow.proof_config.pow_bits = 99;
+        forged_pow.queries_per_fri_repetition.truncate(2);
+        assert!(
+            !verify(&forged_pow),
+            "the proof must not claim extra PoW to reduce FRI queries"
+        );
+
+        assert!(verify(&proof), "the original proof must still verify");
     }
 
     #[test]
@@ -1342,7 +1373,7 @@ mod test {
             GoldilocksPoisedonTranscript,
             GoldilocksPoseidonSponge<AbsorptionModeOverwrite>,
             NoPow,
-        >(&worker, proof_config, ());
+        >(&worker, proof_config.clone(), ());
 
         let builder_impl = CsVerifierBuilder::<F, GoldilocksExt2>::new_from_parameters(geometry);
         let builder = new_builder::<_, F>(builder_impl);
@@ -1358,6 +1389,7 @@ mod test {
             (),
             &vk,
             &proof,
+            &proof_config,
         );
 
         assert!(is_valid);
@@ -1443,7 +1475,7 @@ mod test {
             GoldilocksPoisedonTranscript,
             GoldilocksPoseidonSponge<AbsorptionModeOverwrite>,
             NoPow,
-        >(&worker, proof_config, ());
+        >(&worker, proof_config.clone(), ());
 
         let builder_impl = CsVerifierBuilder::<F, GoldilocksExt2>::new_from_parameters(geometry);
         let builder = new_builder::<_, F>(builder_impl);
@@ -1459,6 +1491,7 @@ mod test {
             (),
             &vk,
             &proof,
+            &proof_config,
         );
 
         assert!(is_valid);
@@ -1661,6 +1694,7 @@ mod test {
         let proof_config = ProofConfig {
             fri_lde_factor: lde_factor_to_use,
             pow_bits: 0,
+            security_level: 80,
             ..Default::default()
         };
 
@@ -1673,7 +1707,7 @@ mod test {
             GoldilocksPoisedonTranscript,
             GoldilocksPoseidonSponge<AbsorptionModeOverwrite>,
             NoPow,
-        >(&worker, proof_config, ());
+        >(&worker, proof_config.clone(), ());
 
         let builder_impl = CsVerifierBuilder::<F, GoldilocksExt2>::new_from_parameters(geometry);
         let builder = new_builder::<_, F>(builder_impl);
@@ -1688,6 +1722,7 @@ mod test {
             (),
             &vk,
             &proof,
+            &proof_config,
         );
 
         assert!(is_valid);

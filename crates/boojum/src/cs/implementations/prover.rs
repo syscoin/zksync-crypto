@@ -1842,6 +1842,11 @@ impl<
         let c0 = transcript.get_challenge();
         let c1 = transcript.get_challenge();
 
+        // Commitments and opening claims are fixed before the affine lift is drawn.
+        let lift_offset = ExtensionField::<F, 2, EXT>::from_coeff_in_base(
+            transcript.get_multiple_challenges_fixed::<2>(),
+        );
+
         let mut total_num_challenges = 0;
         total_num_challenges += num_poly_values_at_z;
         total_num_challenges += 1;
@@ -2062,6 +2067,15 @@ impl<
         }
 
         assert_eq!(challenges_offset, challenges.len());
+
+        degree_lift_fri_opening(
+            &mut outer_c0,
+            &mut outer_c1,
+            &x_poly_lde_subset,
+            lift_offset,
+            worker,
+            ctx,
+        );
 
         // for simplicity we transform c0 and c1 into ArcGenericPoly
 
@@ -2543,6 +2557,56 @@ fn quotening_operation<
     }
 }
 
+fn degree_lift_fri_opening<
+    F: SmallField,
+    EXT: FieldExtension<2, BaseField = F>,
+    P: field::traits::field_like::PrimeFieldLikeVectorized<Base = F>,
+    A: GoodAllocator,
+    B: GoodAllocator,
+>(
+    destination_c0: &mut [Vec<P, A>],
+    destination_c1: &mut [Vec<P, A>],
+    precomputed_cosets: &ArcGenericLdeStorage<F, P, A, B>,
+    lift_offset: ExtensionField<F, 2, EXT>,
+    worker: &Worker,
+    ctx: &mut P::Context,
+) {
+    // Openings of degree < N sources have degree < N - 1. Sampling the full
+    // extension offset after source commitments prevents a fixed rational pole
+    // from cancelling the lift, including at lookup's opening point zero.
+    assert_eq!(destination_c0.len(), destination_c1.len());
+    assert_eq!(destination_c0.len(), precomputed_cosets.outer_len());
+
+    for ((c0, c1), coset) in destination_c0
+        .iter_mut()
+        .zip(destination_c1.iter_mut())
+        .zip(precomputed_cosets.storage.iter())
+    {
+        assert_eq!(c0.len(), c1.len());
+        assert_eq!(c0.len(), coset.storage.len());
+        worker.scope(c0.len(), |scope, chunk_size| {
+            for ((c0, c1), roots) in c0
+                .chunks_mut(chunk_size)
+                .zip(c1.chunks_mut(chunk_size))
+                .zip(coset.storage.chunks(chunk_size))
+            {
+                let mut ctx = *ctx;
+                scope.spawn(move |_| {
+                    let offset_c0 = P::constant(lift_offset.coeffs[0], &mut ctx);
+                    let offset_c1 = P::constant(lift_offset.coeffs[1], &mut ctx);
+                    for ((c0, c1), x) in c0.iter_mut().zip(c1.iter_mut()).zip(roots.iter()) {
+                        let mut lift_c0 = *x;
+                        lift_c0.add_assign(&offset_c0, &mut ctx);
+                        mul_assign_vectorized_in_extension::<F, P, EXT>(
+                            c0, c1, &lift_c0, &offset_c1, &mut ctx,
+                        );
+                    }
+                });
+            }
+        });
+    }
+}
+
 fn quotening_operation_in_extension<
     F: SmallField,
     EXT: FieldExtension<2, BaseField = F>,
@@ -2936,4 +3000,451 @@ pub fn compute_selector_subpath<
 
     let existing = buffer.insert(path, subset);
     debug_assert!(existing.is_none());
+}
+
+#[cfg(test)]
+mod degree_lift_tests {
+    use super::*;
+    use crate::algebraic_props::round_function::AbsorptionModeOverwrite;
+    use crate::algebraic_props::sponge::GoldilocksPoseidonSponge;
+    use crate::cs::implementations::transcript::GoldilocksPoisedonTranscript;
+    use crate::field::goldilocks::{GoldilocksExt2, GoldilocksField};
+    use crate::field::{PrimeField, U64Representable};
+
+    type F = GoldilocksField;
+    type E = ExtensionField<F, 2, GoldilocksExt2>;
+    const N: usize = 16;
+    const LDE_FACTOR: usize = 4;
+
+    fn source_value(at: E, degree: usize) -> E {
+        let mut result =
+            E::from_coeff_in_base([F::from_u64_unchecked(3), F::from_u64_unchecked(5)]);
+        for _ in 0..degree {
+            result.mul_assign(&at);
+        }
+        result.add_assign(&E::from_coeff_in_base([
+            F::from_u64_unchecked(7),
+            F::from_u64_unchecked(11),
+        ]));
+        result
+    }
+
+    fn opening_points_and_challenges() -> [(E, (F, F)); 4] {
+        let z = E::from_coeff_in_base([F::from_u64_unchecked(13), F::from_u64_unchecked(17)]);
+        let omega = domain_generator_for_size::<F>(N as u64);
+        let mut z_omega = z;
+        z_omega.mul_assign_by_base(&omega);
+        let mut public_input_point = omega;
+        public_input_point.square();
+        public_input_point.mul_assign(&omega);
+
+        [
+            (z, (F::from_u64_unchecked(2), F::from_u64_unchecked(3))),
+            (
+                z_omega,
+                (F::from_u64_unchecked(5), F::from_u64_unchecked(7)),
+            ),
+            (
+                E::ZERO,
+                (F::from_u64_unchecked(11), F::from_u64_unchecked(13)),
+            ),
+            (
+                E::from_coeff_in_base([public_input_point, F::ZERO]),
+                (F::from_u64_unchecked(17), F::from_u64_unchecked(19)),
+            ),
+        ]
+    }
+
+    fn lift_offset() -> E {
+        E::from_coeff_in_base([F::from_u64_unchecked(29), F::from_u64_unchecked(31)])
+    }
+
+    fn as_arc(values: Vec<Vec<F>>) -> ArcGenericLdeStorage<F, F, Global, Global> {
+        ArcGenericLdeStorage::from_owned(GenericLdeStorage {
+            storage: values
+                .into_iter()
+                .map(GenericPolynomial::<F, BitreversedLagrangeForm, F, Global>::from_storage)
+                .collect(),
+        })
+    }
+
+    fn opening_batch(
+        degree: usize,
+        false_zero_claim: bool,
+        worker: &Worker,
+    ) -> (
+        Vec<Vec<F>>,
+        Vec<Vec<F>>,
+        ArcGenericLdeStorage<F, F, Global, Global>,
+    ) {
+        let roots = materialize_x_poly_as_arc_lde::<F, F, Global, Global>(
+            N,
+            LDE_FACTOR,
+            F::multiplicative_generator(),
+            worker,
+            &mut (),
+        );
+        let mut source_c0 = vec![];
+        let mut source_c1 = vec![];
+        for coset in roots.storage.iter() {
+            let mut c0 = vec![];
+            let mut c1 = vec![];
+            for x in coset.storage.iter() {
+                let value = source_value(E::from_coeff_in_base([*x, F::ZERO]), degree);
+                c0.push(value.coeffs[0]);
+                c1.push(value.coeffs[1]);
+            }
+            source_c0.push(c0);
+            source_c1.push(c1);
+        }
+        let sources = [Some(as_arc(source_c0)), Some(as_arc(source_c1))];
+        let mut c0 = vec![vec![F::ZERO; N]; LDE_FACTOR];
+        let mut c1 = c0.clone();
+        for (at, challenge) in opening_points_and_challenges() {
+            let mut claimed_value = source_value(at, degree);
+            if false_zero_claim && at == E::ZERO {
+                claimed_value.add_assign(&E::ONE);
+            }
+            quotening_operation_in_extension(
+                &mut c0,
+                &mut c1,
+                vec![sources.clone()],
+                vec![claimed_value],
+                &roots,
+                at,
+                &[challenge],
+                worker,
+                &mut (),
+            );
+        }
+        (c0, c1, roots)
+    }
+
+    fn run_fri(c0: Vec<Vec<F>>, c1: Vec<Vec<F>>, worker: &Worker) -> [Vec<F>; 2] {
+        let mut transcript = GoldilocksPoisedonTranscript::new(());
+        do_fri::<
+            F,
+            F,
+            GoldilocksExt2,
+            GoldilocksPoisedonTranscript,
+            GoldilocksPoseidonSponge<AbsorptionModeOverwrite>,
+            Global,
+            Global,
+        >(
+            as_arc(c0),
+            as_arc(c1),
+            &mut transcript,
+            vec![1, 1],
+            LDE_FACTOR,
+            4,
+            worker,
+            &mut (),
+        )
+        .monomial_forms
+    }
+
+    fn assert_exact_degree(c0: &[Vec<F>], c1: &[Vec<F>], degree: usize) {
+        let monomials = [c0, c1].map(|values| {
+            let mut flattened: Vec<_> = values.iter().flatten().copied().collect();
+            crate::fft::bitreverse_enumeration_inplace(&mut flattened);
+            crate::field::traits::field_like::ifft_natural_to_natural(
+                &mut flattened,
+                F::multiplicative_generator(),
+            );
+            flattened
+        });
+        assert!(monomials[0][degree] != F::ZERO || monomials[1][degree] != F::ZERO);
+        for coefficients in monomials {
+            assert!(coefficients[(degree + 1)..].iter().all(|el| *el == F::ZERO));
+        }
+    }
+
+    fn fixed_lift(
+        c0: &mut [Vec<F>],
+        c1: &mut [Vec<F>],
+        roots: &ArcGenericLdeStorage<F, F, Global, Global>,
+        offset: F,
+    ) {
+        for (coset_idx, coset) in roots.storage.iter().enumerate() {
+            for (idx, x) in coset.storage.iter().enumerate() {
+                let mut factor = *x;
+                factor.add_assign(&offset);
+                c0[coset_idx][idx].mul_assign(&factor);
+                c1[coset_idx][idx].mul_assign(&factor);
+            }
+        }
+    }
+
+    #[test]
+    fn fri_degree_lift_accepts_maximum_honest_source_degree() {
+        let worker = Worker::new_with_num_threads(2);
+        let (mut c0, mut c1, roots) = opening_batch(N - 1, false, &worker);
+        degree_lift_fri_opening(&mut c0, &mut c1, &roots, lift_offset(), &worker, &mut ());
+        assert_exact_degree(&c0, &c1, N - 1);
+
+        for (outer, coset) in roots.storage.iter().enumerate() {
+            for (inner, x) in coset.storage.iter().enumerate() {
+                let x_ext = E::from_coeff_in_base([*x, F::ZERO]);
+                let mut expected = E::ZERO;
+                for (at, (a, b)) in opening_points_and_challenges() {
+                    let mut numerator = source_value(x_ext, N - 1);
+                    numerator.sub_assign(&source_value(at, N - 1));
+                    let mut denominator = x_ext;
+                    denominator.sub_assign(&at);
+                    numerator.mul_assign(&denominator.inverse().unwrap());
+                    numerator.mul_assign(&E::from_coeff_in_base([a, b]));
+                    expected.add_assign(&numerator);
+                }
+                let mut lift = x_ext;
+                lift.add_assign(&lift_offset());
+                expected.mul_assign(&lift);
+                assert_eq!(c0[outer][inner], expected.coeffs[0]);
+                assert_eq!(c1[outer][inner], expected.coeffs[1]);
+            }
+        }
+        let monomials = run_fri(c0, c1, &worker);
+        assert_eq!(monomials[0].len(), N / 4);
+        assert_eq!(monomials[1].len(), N / 4);
+    }
+
+    #[test]
+    fn fri_degree_lift_rejects_degree_n_source() {
+        let worker = Worker::new_with_num_threads(2);
+        let (mut c0, mut c1, roots) = opening_batch(N, false, &worker);
+        // This source uses the spare degree before the lift, reproducing the
+        // boundary failure under the very same FRI coefficient limit.
+        run_fri(c0.clone(), c1.clone(), &worker);
+        degree_lift_fri_opening(&mut c0, &mut c1, &roots, lift_offset(), &worker, &mut ());
+        assert_exact_degree(&c0, &c1, N);
+        let rejected =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_fri(c0, c1, &worker)));
+        assert!(
+            rejected.is_err(),
+            "the lifted degree-N source must exceed the FRI bound"
+        );
+    }
+
+    #[test]
+    fn fri_degree_lift_rejects_false_lookup_opening_at_zero() {
+        let worker = Worker::new_with_num_threads(2);
+        let (mut c0, mut c1, roots) = opening_batch(N - 1, true, &worker);
+
+        // With the old X lift the false zero claim becomes polynomial and
+        // satisfies FRI's degree bound, even though its numerator is wrong.
+        let mut old_c0 = c0.clone();
+        let mut old_c1 = c1.clone();
+        for (coset_idx, coset) in roots.storage.iter().enumerate() {
+            for (idx, x) in coset.storage.iter().enumerate() {
+                old_c0[coset_idx][idx].mul_assign(x);
+                old_c1[coset_idx][idx].mul_assign(x);
+            }
+        }
+        run_fri(old_c0, old_c1, &worker);
+
+        degree_lift_fri_opening(&mut c0, &mut c1, &roots, lift_offset(), &worker, &mut ());
+        let rejected =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_fri(c0, c1, &worker)));
+        assert!(
+            rejected.is_err(),
+            "a false lookup opening at zero must fail FRI"
+        );
+    }
+
+    #[test]
+    fn fri_degree_lift_rejects_rational_source() {
+        let worker = Worker::new_with_num_threads(2);
+        let roots = materialize_x_poly_as_arc_lde::<F, F, Global, Global>(
+            N,
+            LDE_FACTOR,
+            F::multiplicative_generator(),
+            &worker,
+            &mut (),
+        );
+        let mut two_base = F::ONE;
+        two_base.double();
+        let two = E::from_coeff_in_base([two_base, F::ZERO]);
+        let numerator = E::from_coeff_in_base([F::from_u64_unchecked(23), F::ONE]);
+        let value = |at: E| {
+            let mut denominator = at;
+            denominator.add_assign(&two);
+            let mut result = numerator;
+            result.mul_assign(&denominator.inverse().expect("pole outside tested domain"));
+            result
+        };
+        let mut source_c0 = vec![];
+        let mut source_c1 = vec![];
+        for coset in roots.storage.iter() {
+            let mut c0 = vec![];
+            let mut c1 = vec![];
+            for x in coset.storage.iter() {
+                let source = value(E::from_coeff_in_base([*x, F::ZERO]));
+                c0.push(source.coeffs[0]);
+                c1.push(source.coeffs[1]);
+            }
+            source_c0.push(c0);
+            source_c1.push(c1);
+        }
+        assert_exact_degree(&source_c0, &source_c1, N * LDE_FACTOR - 1);
+        let sources = [Some(as_arc(source_c0)), Some(as_arc(source_c1))];
+        let mut c0 = vec![vec![F::ZERO; N]; LDE_FACTOR];
+        let mut c1 = c0.clone();
+        for (at, challenge) in opening_points_and_challenges() {
+            quotening_operation_in_extension(
+                &mut c0,
+                &mut c1,
+                vec![sources.clone()],
+                vec![value(at)],
+                &roots,
+                at,
+                &[challenge],
+                &worker,
+                &mut (),
+            );
+        }
+        let mut fixed_c0 = c0.clone();
+        let mut fixed_c1 = c1.clone();
+        fixed_lift(&mut fixed_c0, &mut fixed_c1, &roots, two_base);
+        run_fri(fixed_c0, fixed_c1, &worker);
+
+        degree_lift_fri_opening(&mut c0, &mut c1, &roots, lift_offset(), &worker, &mut ());
+        let rejected =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_fri(c0, c1, &worker)));
+        assert!(
+            rejected.is_err(),
+            "a committed rational source must fail FRI"
+        );
+    }
+
+    #[test]
+    fn fri_degree_lift_rejects_false_lookup_rational_sources() {
+        let worker = Worker::new_with_num_threads(2);
+        let roots = materialize_x_poly_as_arc_lde::<F, F, Global, Global>(
+            N,
+            LDE_FACTOR,
+            F::multiplicative_generator(),
+            &worker,
+            &mut (),
+        );
+        let mut two_base = F::ONE;
+        two_base.double();
+        let two = E::from_coeff_in_base([two_base, F::ZERO]);
+        let d = E::from_coeff_in_base([F::from_u64_unchecked(3), F::from_u64_unchecked(5)]);
+        let eta = E::from_coeff_in_base([F::from_u64_unchecked(7), F::from_u64_unchecked(11)]);
+        let a = |x: E| {
+            let mut numerator = x;
+            let mut x_n = x.pow_u64(N as u64);
+            x_n.mul_assign(&two);
+            numerator.add_assign(&x_n);
+            let mut denominator = x;
+            denominator.add_assign(&two);
+            denominator.mul_assign(&d);
+            numerator.mul_assign(&denominator.inverse().expect("pole outside tested domain"));
+            numerator
+        };
+        let q = |x: E| {
+            let mut numerator = eta;
+            numerator.mul_assign(&two);
+            let mut denominator = x;
+            denominator.add_assign(&two);
+            numerator.mul_assign(&denominator.inverse().expect("pole outside tested domain"));
+            numerator
+        };
+
+        // The false tuple has no matching table row, although all pointwise
+        // inverse, zero-sum, and composition equations used by lookup pass.
+        assert_eq!(a(E::ZERO), E::ZERO);
+        let omega = domain_generator_for_size::<F>(N as u64);
+        let mut row_sum = E::ZERO;
+        for row in 0..N {
+            let h = E::from_coeff_in_base([omega.pow_u64(row as u64), F::ZERO]);
+            let mut inverse_constraint = a(h);
+            inverse_constraint.mul_assign(&d);
+            assert_eq!(inverse_constraint, E::ONE);
+            row_sum.add_assign(&a(h));
+        }
+        assert_ne!(row_sum, E::ZERO);
+
+        let mut a_c0 = vec![];
+        let mut a_c1 = vec![];
+        let mut q_c0 = vec![];
+        let mut q_c1 = vec![];
+        for coset in roots.storage.iter() {
+            let mut a0 = vec![];
+            let mut a1 = vec![];
+            let mut q0 = vec![];
+            let mut q1 = vec![];
+            for x in coset.storage.iter() {
+                let x = E::from_coeff_in_base([*x, F::ZERO]);
+                let a_value = a(x);
+                let q_value = q(x);
+                let mut lhs = a_value;
+                lhs.mul_assign(&d);
+                lhs.sub_assign(&E::ONE);
+                lhs.mul_assign(&eta);
+                let mut rhs = x.pow_u64(N as u64);
+                rhs.sub_assign(&E::ONE);
+                rhs.mul_assign(&q_value);
+                assert_eq!(lhs, rhs);
+                a0.push(a_value.coeffs[0]);
+                a1.push(a_value.coeffs[1]);
+                q0.push(q_value.coeffs[0]);
+                q1.push(q_value.coeffs[1]);
+            }
+            a_c0.push(a0);
+            a_c1.push(a1);
+            q_c0.push(q0);
+            q_c1.push(q1);
+        }
+        assert_exact_degree(&a_c0, &a_c1, N * LDE_FACTOR - 1);
+        assert_exact_degree(&q_c0, &q_c1, N * LDE_FACTOR - 1);
+        let a_sources = [Some(as_arc(a_c0)), Some(as_arc(a_c1))];
+        let q_sources = [Some(as_arc(q_c0)), Some(as_arc(q_c1))];
+        let z = opening_points_and_challenges()[0].0;
+        let mut lhs_at_z = a(z);
+        lhs_at_z.mul_assign(&d);
+        lhs_at_z.sub_assign(&E::ONE);
+        lhs_at_z.mul_assign(&eta);
+        let mut rhs_at_z = z.pow_u64(N as u64);
+        rhs_at_z.sub_assign(&E::ONE);
+        rhs_at_z.mul_assign(&q(z));
+        assert_eq!(lhs_at_z, rhs_at_z);
+
+        let mut c0 = vec![vec![F::ZERO; N]; LDE_FACTOR];
+        let mut c1 = c0.clone();
+        for (at, source, claim, challenge) in [
+            (z, a_sources.clone(), a(z), (F::ONE, F::ONE)),
+            (z, q_sources, q(z), (F::from_u64_unchecked(3), F::ONE)),
+            (
+                E::ZERO,
+                a_sources,
+                E::ZERO,
+                (F::from_u64_unchecked(5), F::ONE),
+            ),
+        ] {
+            quotening_operation_in_extension(
+                &mut c0,
+                &mut c1,
+                vec![source],
+                vec![claim],
+                &roots,
+                at,
+                &[challenge],
+                &worker,
+                &mut (),
+            );
+        }
+        let mut fixed_c0 = c0.clone();
+        let mut fixed_c1 = c1.clone();
+        fixed_lift(&mut fixed_c0, &mut fixed_c1, &roots, two_base);
+        assert_exact_degree(&fixed_c0, &fixed_c1, N - 1);
+        run_fri(fixed_c0, fixed_c1, &worker);
+
+        degree_lift_fri_opening(&mut c0, &mut c1, &roots, lift_offset(), &worker, &mut ());
+        let rejected =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_fri(c0, c1, &worker)));
+        assert!(
+            rejected.is_err(),
+            "false lookup rational sources must fail FRI"
+        );
+    }
 }

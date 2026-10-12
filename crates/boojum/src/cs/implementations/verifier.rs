@@ -1,4 +1,5 @@
 use super::proof::Proof;
+use super::prover::ProofConfig;
 use super::transcript::Transcript;
 use super::*;
 
@@ -885,6 +886,7 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>> Verifier<F, EXT> {
         )
     }
 
+    /// `expected_proof_config` must come from verifier policy, independently of `proof`.
     pub fn verify<
         H: TreeHasher<F>,
         TR: Transcript<F, CompatibleCap = H::Output>,
@@ -894,7 +896,13 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>> Verifier<F, EXT> {
         transcript_params: TR::TransciptParameters,
         vk: &VerificationKey<F, H>,
         proof: &Proof<F, H, EXT>,
+        expected_proof_config: &ProofConfig,
     ) -> bool {
+        if &proof.proof_config != expected_proof_config {
+            log!("Proof configuration differs from verifier expectation");
+            return false;
+        }
+
         let mut transcript = TR::new(transcript_params);
 
         if self.parameters != vk.fixed_parameters.parameters {
@@ -1818,6 +1826,9 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>> Verifier<F, EXT> {
         // get challenges
         let c0 = transcript.get_challenge();
         let c1 = transcript.get_challenge();
+        let lift_offset = ExtensionField::<F, 2, EXT>::from_coeff_in_base(
+            transcript.get_multiple_challenges_fixed::<2>(),
+        );
 
         let mut total_num_challenges = 0;
         total_num_challenges += proof.values_at_z.len();
@@ -2034,6 +2045,7 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>> Verifier<F, EXT> {
                 num_queries,
                 proof.queries_per_fri_repetition.len(),
             );
+            return false;
         }
 
         let base_oracle_depth = vk.fixed_parameters.base_oracles_depth();
@@ -2382,6 +2394,14 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>> Verifier<F, EXT> {
             }
 
             assert_eq!(challenge_offset, challenges_for_fri_quotiening.len());
+
+            let mut lift = lift_offset;
+            let x = ExtensionField::<F, 2, EXT>::from_coeff_in_base([
+                domain_element_for_quotiening,
+                F::ZERO,
+            ]);
+            lift.add_assign(&x);
+            simulated_ext_element.mul_assign(&lift);
 
             let mut current_folded_value = simulated_ext_element;
             let mut subidx = base_tree_idx;
