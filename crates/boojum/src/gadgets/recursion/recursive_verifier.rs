@@ -2025,6 +2025,10 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>, CS: ConstraintSystem<
                 let mut base_pow = power_chunks[idx];
 
                 for challenge in challenges.iter() {
+                    let mut coset_pow = base_pow;
+                    let coset_inverse_constant = NumAsFieldWrapper::constant(coset_inverse, cs);
+                    coset_pow.mul_assign(&coset_inverse_constant, cs);
+
                     for (i, [a, b]) in elements_to_interpolate
                         .as_chunks::<2>()
                         .0
@@ -2038,10 +2042,11 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>, CS: ConstraintSystem<
                         diff.sub_assign(b, cs);
                         diff.mul_assign(challenge, cs);
                         // divide by corresponding power
-                        let mut pow = base_pow;
-                        pow.mul_assign(&interpolation_steps[i], cs);
-                        let coset_inverse = NumAsFieldWrapper::constant(coset_inverse, cs);
-                        pow.mul_assign(&coset_inverse, cs);
+                        let mut pow = coset_pow;
+                        // Step zero was fixed to one before the steps were allocated.
+                        if i != 0 {
+                            pow.mul_assign(&interpolation_steps[i], cs);
+                        }
 
                         NumExtAsFieldWrapper::<F, EXT, CS>::mul_by_base_and_accumulate_into(
                             &mut result,
