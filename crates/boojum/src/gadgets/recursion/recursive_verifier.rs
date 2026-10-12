@@ -1530,6 +1530,8 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>, CS: ConstraintSystem<
 
         let omega = precomputed_powers[fixed_parameters.domain_size.trailing_zeros() as usize];
         let omega_cs_constant = NumAsFieldWrapper::constant(omega, cs);
+        let mut z_omega = z;
+        z_omega.mul_assign_by_base(&omega_cs_constant, cs);
 
         // we also want to precompute "steps" for different interpolation degrees
         // e.g. if we interpolate 8 elements,
@@ -1706,9 +1708,6 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>, CS: ConstraintSystem<
             let base_coset_inverse = F::multiplicative_generator().inverse().unwrap();
 
             {
-                let mut z_omega = z;
-                z_omega.mul_assign_by_base(&omega_cs_constant, cs);
-
                 let cast_from_base = move |el: &[Num<F>]| {
                     el.iter()
                         .map(|el| {
