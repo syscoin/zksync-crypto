@@ -2024,7 +2024,7 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>, CS: ConstraintSystem<
 
                 let mut base_pow = power_chunks[idx];
 
-                for challenge in challenges.iter() {
+                for (round, challenge) in challenges.iter().enumerate() {
                     let mut coset_pow = base_pow;
                     let coset_inverse_constant = NumAsFieldWrapper::constant(coset_inverse, cs);
                     coset_pow.mul_assign(&coset_inverse_constant, cs);
@@ -2063,7 +2063,10 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>, CS: ConstraintSystem<
 
                     std::mem::swap(&mut next, &mut elements_to_interpolate);
                     next.clear();
-                    base_pow.square(cs);
+                    if round + 1 < challenges.len() {
+                        base_pow.square(cs);
+                    }
+                    // This factor carries into the next FRI oracle group.
                     coset_inverse.square();
                 }
 
