@@ -2081,13 +2081,15 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>, CS: ConstraintSystem<
 
             // and we should evaluate monomial form and compare
 
-            let mut result_from_monomial = zero_ext;
-            // horner rule
-            for (c0, c1) in proof.final_fri_monomials[0]
+            let mut coefficients = proof.final_fri_monomials[0]
                 .iter()
                 .zip(proof.final_fri_monomials[1].iter())
-                .rev()
-            {
+                .rev();
+            let (c0, c1) = coefficients.next().expect("nonempty final FRI polynomial");
+            let mut result_from_monomial =
+                NumExtAsFieldWrapper::<F, EXT, CS>::from_num_coeffs_in_base([*c0, *c1]);
+            // horner rule
+            for (c0, c1) in coefficients {
                 let coeff = NumExtAsFieldWrapper::<F, EXT, CS>::from_num_coeffs_in_base([*c0, *c1]);
 
                 // result_from_monomial = result_from_monomial * z + coeff
