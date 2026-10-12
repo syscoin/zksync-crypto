@@ -1400,6 +1400,58 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>, CS: ConstraintSystem<
         let challenges_for_fri_quotiening =
             materialize_powers_serial::<F, EXT, CS>(cs, challenge, total_num_challenges);
 
+        // Claims and batching weights are query-independent; constrain their sum once.
+        let mut opening_challenge_offset = 0;
+        let weighted_claim_at_z = precompute_opening_claim(
+            cs,
+            &all_values_at_z,
+            &challenges_for_fri_quotiening[..all_values_at_z.len()],
+        );
+        opening_challenge_offset += all_values_at_z.len();
+        let weighted_claim_at_z_omega = precompute_opening_claim(
+            cs,
+            &all_values_at_z_omega,
+            &challenges_for_fri_quotiening
+                [opening_challenge_offset..opening_challenge_offset + all_values_at_z_omega.len()],
+        );
+        opening_challenge_offset += all_values_at_z_omega.len();
+        let weighted_claim_at_0 = if self.lookup_parameters.lookup_is_allowed() {
+            let claim = precompute_opening_claim(
+                cs,
+                &all_values_at_0,
+                &challenges_for_fri_quotiening
+                    [opening_challenge_offset..opening_challenge_offset + all_values_at_0.len()],
+            );
+            opening_challenge_offset += all_values_at_0.len();
+            Some(claim)
+        } else {
+            None
+        };
+        let mut public_input_claims = Vec::with_capacity(public_input_opening_tuples.len());
+        for (_, set) in public_input_opening_tuples.iter() {
+            let values: Vec<_> = set
+                .iter()
+                .map(|(_, expected_value)| {
+                    NumExtAsFieldWrapper::<F, EXT, CS>::from_coeffs_in_base([
+                        *expected_value,
+                        zero_base,
+                    ])
+                })
+                .collect();
+            let weighted_claim = precompute_opening_claim(
+                cs,
+                &values,
+                &challenges_for_fri_quotiening
+                    [opening_challenge_offset..opening_challenge_offset + values.len()],
+            );
+            opening_challenge_offset += values.len();
+            public_input_claims.push((values, weighted_claim));
+        }
+        assert_eq!(
+            opening_challenge_offset,
+            challenges_for_fri_quotiening.len()
+        );
+
         let (
             new_pow_bits,                 // updated POW bits if needed
             num_queries,                  // num queries
@@ -1789,6 +1841,7 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>, CS: ConstraintSystem<
                     &mut simulated_ext_element,
                     &sources,
                     values_at_z,
+                    weighted_claim_at_z,
                     domain_element_for_quotiening,
                     z,
                     &challenges_for_fri_quotiening
@@ -1810,6 +1863,7 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>, CS: ConstraintSystem<
                     &mut simulated_ext_element,
                     &sources,
                     values_at_z_omega,
+                    weighted_claim_at_z_omega,
                     domain_element_for_quotiening,
                     z_omega,
                     &challenges_for_fri_quotiening
@@ -1839,6 +1893,7 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>, CS: ConstraintSystem<
                         &mut simulated_ext_element,
                         &sources,
                         values_at_0,
+                        weighted_claim_at_0.expect("lookup claims were precomputed"),
                         domain_element_for_quotiening,
                         zero_ext,
                         &challenges_for_fri_quotiening
@@ -1850,20 +1905,16 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>, CS: ConstraintSystem<
             }
 
             // and public inputs
-            for (open_at, set) in public_input_opening_tuples.iter() {
+            for ((open_at, set), (values, weighted_claim)) in public_input_opening_tuples
+                .iter()
+                .zip(public_input_claims.iter())
+            {
                 let mut sources = Vec::with_capacity(set.len());
-                let mut values = Vec::with_capacity(set.len());
-                for (column, expected_value) in set {
+                for (column, _) in set {
                     let c0 = queries.witness_query.leaf_elements[*column];
                     let el =
                         NumExtAsFieldWrapper::<F, EXT, CS>::from_num_coeffs_in_base([c0, zero_num]);
                     sources.push(el);
-
-                    let value = NumExtAsFieldWrapper::<F, EXT, CS>::from_coeffs_in_base([
-                        *expected_value,
-                        zero_base,
-                    ]);
-                    values.push(value);
                 }
                 let num_challenges_required = sources.len();
                 assert_eq!(values.len(), num_challenges_required);
@@ -1878,7 +1929,8 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>, CS: ConstraintSystem<
                     cs,
                     &mut simulated_ext_element,
                     &sources,
-                    &values,
+                    values,
+                    *weighted_claim,
                     domain_element_for_quotiening,
                     open_at,
                     &challenges_for_fri_quotiening
@@ -2062,6 +2114,26 @@ impl<F: SmallField, EXT: FieldExtension<2, BaseField = F>, CS: ConstraintSystem<
     }
 }
 
+fn precompute_opening_claim<
+    F: SmallField,
+    EXT: FieldExtension<2, BaseField = F>,
+    CS: ConstraintSystem<F> + 'static,
+>(
+    cs: &mut CS,
+    values_at: &[NumExtAsFieldWrapper<F, EXT, CS>],
+    challenges: &[NumExtAsFieldWrapper<F, EXT, CS>],
+) -> NumExtAsFieldWrapper<F, EXT, CS> {
+    assert_eq!(values_at.len(), challenges.len());
+    let mut claim = NumExtAsFieldWrapper::<F, EXT, CS>::zero(cs);
+    for (value_at, challenge) in values_at.iter().zip(challenges.iter()) {
+        NumExtAsFieldWrapper::<F, EXT, CS>::mul_and_accumulate_into(
+            &mut claim, value_at, challenge, cs,
+        );
+    }
+    claim.negate(cs);
+    claim
+}
+
 fn quotening_operation<
     F: SmallField,
     EXT: FieldExtension<2, BaseField = F>,
@@ -2069,8 +2141,9 @@ fn quotening_operation<
 >(
     cs: &mut CS,
     dst: &mut NumExtAsFieldWrapper<F, EXT, CS>,
-    polynomial_values: &Vec<NumExtAsFieldWrapper<F, EXT, CS>>,
-    values_at: &Vec<NumExtAsFieldWrapper<F, EXT, CS>>,
+    polynomial_values: &[NumExtAsFieldWrapper<F, EXT, CS>],
+    values_at: &[NumExtAsFieldWrapper<F, EXT, CS>],
+    weighted_claim: NumExtAsFieldWrapper<F, EXT, CS>,
     domain_element: NumAsFieldWrapper<F, CS>,
     at: NumExtAsFieldWrapper<F, EXT, CS>,
     challenges: &[NumExtAsFieldWrapper<F, EXT, CS>],
@@ -2086,22 +2159,11 @@ fn quotening_operation<
     denom.sub_assign(&at, cs);
     denom = denom.inverse(cs);
 
-    let mut acc = NumExtAsFieldWrapper::<F, EXT, CS>::zero(cs);
-
-    for ((poly_value, value_at), challenge) in polynomial_values
-        .iter()
-        .zip(values_at.iter())
-        .zip(challenges.iter())
-    {
-        // (f(x) - f(z))/(x - z)
-        let mut tmp = *poly_value;
-        tmp.sub_assign(value_at, cs);
-
-        NumExtAsFieldWrapper::<F, EXT, CS>::mul_and_accumulate_into(&mut acc, &tmp, challenge, cs);
-
-        // let mut as_ext = *challenge;
-        // as_ext.mul_assign(&tmp, cs);
-        // acc.add_assign(&as_ext, cs);
+    let mut acc = weighted_claim;
+    for (poly_value, challenge) in polynomial_values.iter().zip(challenges.iter()) {
+        NumExtAsFieldWrapper::<F, EXT, CS>::mul_and_accumulate_into(
+            &mut acc, poly_value, challenge, cs,
+        );
     }
 
     NumExtAsFieldWrapper::<F, EXT, CS>::mul_and_accumulate_into(dst, &acc, &denom, cs);
@@ -2652,3 +2714,7 @@ mod test {
         dbg!(cs.next_available_row());
     }
 }
+
+#[cfg(test)]
+#[path = "recursive_verifier_tests.rs"]
+mod opening_precompute_tests;
