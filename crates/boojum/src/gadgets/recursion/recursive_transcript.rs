@@ -1,5 +1,9 @@
 use super::*;
 use crate::algebraic_props::sponge::GenericAlgebraicSpongeState;
+use crate::config::{CSConfig, CSWitnessEvaluationConfig};
+use crate::cs::gates::{
+    ConstantAllocatableCS, FmaGateInBaseFieldWithoutConstant, FmaGateInBaseWithoutConstantParams,
+};
 use crate::cs::implementations::transcript::Transcript;
 use crate::cs::traits::cs::ConstraintSystem;
 use crate::field::goldilocks::GoldilocksField;
@@ -89,6 +93,7 @@ impl<F: SmallField> BoolsBuffer<F> {
             // get 1 field element form transcript
             let field_el = transcript.get_challenge(cs);
             let el_bits = field_el.spread_into_bits::<CS, 64>(cs);
+            enforce_canonical_goldilocks_bits(cs, field_el, &el_bits);
             let mut lsb_iterator = el_bits.iter();
 
             for _ in 0..bits_avaiable {
@@ -99,6 +104,56 @@ impl<F: SmallField> BoolsBuffer<F> {
             self.get_bits(cs, transcript, num_bits)
         }
     }
+}
+
+fn enforce_canonical_goldilocks_bits<F: SmallField, CS: ConstraintSystem<F>>(
+    cs: &mut CS,
+    field_el: Num<F>,
+    bits: &[Boolean<F>; 64],
+) {
+    assert_eq!(F::CHAR, GoldilocksField::ORDER);
+    // If all upper bits are one, the represented integer is p - 1 plus
+    // the lower word. In that case canonicality is equivalent to x + 1 = 0.
+    let thirty_two = cs.allocate_constant(F::from_u64_unchecked(32));
+    let mut upper_terms: Vec<_> = bits[32..]
+        .iter()
+        .map(|bit| (bit.get_variable(), F::MINUS_ONE))
+        .collect();
+    upper_terms.push((thirty_two, F::ONE));
+    let upper_zero_count = Num::linear_combination(cs, &upper_terms);
+    let quotient = cs.alloc_variable_without_value();
+    if <CS::Config as CSConfig>::WitnessConfig::EVALUATE_WITNESS {
+        cs.set_values_with_dependencies(
+            &[
+                upper_zero_count.get_variable().into(),
+                field_el.get_variable().into(),
+            ],
+            &[quotient.into()],
+            |[zero_count, mut value]: [F; 2]| {
+                crate::field::Field::add_assign(&mut value, &F::ONE);
+                let quotient = crate::field::PrimeField::inverse(&zero_count)
+                    .map(|mut inverse| {
+                        crate::field::Field::mul_assign(&mut inverse, &value);
+                        inverse
+                    })
+                    .unwrap_or(F::ZERO);
+                [quotient]
+            },
+        );
+    }
+    // H * quotient = x + 1 forces x = -1 whenever H = 0. No choice of
+    // quotient can bypass that case; when H is nonzero the encoding is already canonical.
+    let one = cs.allocate_constant(F::ONE);
+    let gate = FmaGateInBaseFieldWithoutConstant {
+        params: FmaGateInBaseWithoutConstantParams {
+            coeff_for_quadtaric_part: F::ONE,
+            linear_term_coeff: F::MINUS_ONE,
+        },
+        quadratic_part: (upper_zero_count.get_variable(), quotient),
+        linear_part: field_el.get_variable(),
+        rhs_part: one,
+    };
+    gate.add_to_cs(cs);
 }
 
 #[derive(Derivative)]
@@ -243,3 +298,7 @@ pub type GoldilocksPoisedon2CircuitTranscript =
 impl RecursiveTranscript<GoldilocksField> for GoldilocksPoisedon2Transcript {
     type CircuitReflection = GoldilocksPoisedon2CircuitTranscript;
 }
+
+#[cfg(test)]
+#[path = "recursive_transcript_tests.rs"]
+mod tests;
