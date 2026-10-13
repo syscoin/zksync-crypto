@@ -300,7 +300,7 @@ impl<E: Engine> GoldilocksField<E> {
             let a = a.into_repr().as_ref()[0] as u128;
             let b = b.into_repr().as_ref()[0] as u128;
 
-            if a + b > Self::ORDER as u128 {
+            if a + b >= Self::ORDER as u128 {
                 Some(true)
             } else {
                 Some(false)
@@ -779,3 +779,7 @@ mod test {
         assert!(assembly.is_satisfied());
     }
 }
+
+#[cfg(test)]
+#[path = "boundary_tests.rs"]
+mod boundary_tests;
